@@ -1,0 +1,345 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use utf8;
+
+use YAML::Syck qw/LoadFile/;
+use FindBin;
+
+# 環境変数PATH_ATB_CONFIGからDB名とSQLディレクトリとDBバージョンを取得
+my ($DB_NAME, $DB_VERSION) = eval {
+  # 環境変数PATH_ATB_CONFIGが設定されていなければ終了
+  die "run `export PATH_ATB_CONFIG={atb-conf.yaml}`\n" unless(exists($ENV{PATH_ATB_CONFIG}));
+
+  # PATH_ATB_CONFIGに{atb-conf.yaml}ファイルが設定されてなければ終了
+  die "[$ENV{PATH_ATB_CONFIG}] does not exists\n" unless(-f $ENV{PATH_ATB_CONFIG});
+
+  # PATH_ATB_CONFIGのYAMLパースに失敗すれば終了
+  my $atb_conf = eval { LoadFile($ENV{PATH_ATB_CONFIG}) };
+  die "see [$ENV{PATH_ATB_CONFIG}]\n" unless($atb_conf);
+
+  # {atb-conf.yaml}がハッシュ以外なら終了
+  die "[$ENV{PATH_ATB_CONFIG}] isn't HASH object\n" unless(ref($atb_conf) eq 'HASH');
+
+  # {atb-conf.yaml}.database.sqlite3が読み込めなければ終了
+  die "[$ENV{PATH_ATB_CONFIG}].database.sqlite3 does not exists\n"
+    unless(
+      exists($atb_conf->{database}) and ref($atb_conf->{database}) eq 'HASH' and
+      exists($atb_conf->{database}{sqlite3}) and ref($atb_conf->{database}{sqlite3}) eq 'HASH');
+
+  # dbファイルパスが読み込めなければ終了
+  die "[$ENV{PATH_ATB_CONFIG}].database.sqlite3.db_file does not exists\n"
+    unless(
+      exists($atb_conf->{database}{sqlite3}{db_file}) and defined($atb_conf->{database}{sqlite3}{db_file}) and
+      length($atb_conf->{database}{sqlite3}{db_file}) > 1);
+
+  # db/バージョンが読み込めなければ終了
+  die "[$ENV{PATH_ATB_CONFIG}].database.version does not exists\n"
+    unless(
+      exists($atb_conf->{database}{version}) and defined($atb_conf->{database}{version}) and
+      $atb_conf->{database}{version} =~ /^v(\d+)$/);
+
+  return ($atb_conf->{database}{sqlite3}{db_file}, $1);
+};
+die "[error] $@" if($@);
+
+# SQLファイル名
+my $DIR_SQL = $FindBin::Bin."/../sql";
+my $TEMPLATE_MIGRATION_FILE_NAME = $DIR_SQL."/up_%03d.sql";
+my $TEMPLATE_ROLLBACK_SQL_FILE_NAME  = $DIR_SQL."/down_%03d.sql";
+my $TEMPLATE_CHECK_SQL_FILE_NAME  = $DIR_SQL."/check.sql";
+
+use Getopt::Long;
+use File::Temp qw/tempfile/;
+
+# コマンドライン引数を取得する
+my $command = shift @ARGV if(@ARGV);
+
+# オプションパラメータを取得する
+my $options = {};
+my $result = GetOptions( $options
+                       , "version=i"
+                       , "file=s"
+                       );
+
+# 使用方法
+sub usage {
+  print << "USAGE";
+atb-db-tool
+
+  $0 [command] [options]
+    command: [migration|rollback|check|dump|import]
+    options: --version [int]
+             --file [file-path]
+USAGE
+}
+
+# コマンド文字列が指定されていない場合は正常終了
+unless ($command) {
+  usage();
+  exit 0;
+}
+
+# 指定されたSQL(ファイル)を実行する
+sub run_sql {
+  my $sql_obj = shift;
+  die unless(ref $sql_obj eq 'HASH' and (exists $sql_obj->{str} or exists $sql_obj->{file}));
+
+  my $sql_option = undef;
+
+  # SQL文字列
+  if (exists $sql_obj->{str} and defined $sql_obj->{str}) {
+    $sql_option = "\"$sql_obj->{str}\"";
+  # SQLファイル
+  } elsif (exists $sql_obj->{file} and defined $sql_obj->{file}) {
+    $sql_option = "< $sql_obj->{file}";
+  } else {
+    die;
+  }
+
+  # SQLを実行する
+  my $cmd = 'sqlite3 '.$DB_NAME.' '.$sql_option;
+  my $output = `$cmd`;
+
+  # 実行結果を返す
+  return ($cmd, $output, $?);
+}
+
+sub _msg {
+  my $msg = shift;
+  print $msg."\n";
+}
+
+sub error_msg {
+  _msg("[ERROR] ".shift);
+}
+
+sub info_msg {
+  _msg("[INFO] ".shift);
+}
+
+sub debug_msg {
+  _msg("[DEBUG] ".shift);
+}
+
+# 最新バージョンをDBから取得し返す
+sub _get_last_version {
+  # dbがある場合、最新バージョン情報を取得
+  my ($cmd, $ver, $ret) = run_sql({ str => "select version from version order by version desc limit 1;" });
+  if ($ret) {
+    error_msg("fail - version:$_\n - $cmd");
+    die;
+  }
+  info_msg("installed - version:$_") for ((0..$ver));
+  return $ver + 0;
+}
+
+sub _migration {
+  eval {
+    # バージョンオプションが指定されていて、0以下ならエラー
+    if (exists($options->{version}) and defined($options->{version}) and $options->{version} <= 0) {
+      error_msg("version must be one or more");
+      die;
+    }
+
+    my $target_version = $options->{version} // $DB_VERSION;
+
+    # 最初にインストールするバージョン情報
+    my $last_version = (-f $DB_NAME) ? _get_last_version() + 1: 0;
+
+    # 順番に環境をセットアップ(マイグレーション)する
+    for (($last_version..$target_version)) {
+
+      # マイグレーションファイル
+      my $migration_file_name = sprintf( $TEMPLATE_MIGRATION_FILE_NAME, $_ );
+
+      # バージョン方法とマイグレーションファイル名
+      my $output_msg = " - version:$_ - $migration_file_name";
+
+      # マイグレーションファイルがない場合は終了する
+      unless (-f $migration_file_name) {
+        error_msg("fail".$output_msg);
+        die;
+      }
+
+      # マイグレーションを実行する
+      my ($cmd, $ver, $ret) = run_sql({ file => $migration_file_name });
+
+      # 実行にした場合は終了する
+      if ($ret) {
+        error_msg("fail".$output_msg);
+        die;
+      }
+
+      # 実行が正常した次へ
+      info_msg("done".$output_msg);
+    }
+  };
+  return 1 if($@);
+  return 0;
+}
+
+sub _rollback {
+  eval {
+    # バージョンオプションが無指定などの場合はエラー
+    unless(exists($options->{version}) and defined($options->{version})) {
+      error_msg("version is not exists");
+      die;
+    }
+
+    # 指定されたバージョンが0以下ならエラー
+    unless(0 < $options->{version}) {
+      error_msg("version must be one or more");
+      die;
+    }
+    my $target_version = $options->{version};
+
+    # 最初にインストールするバージョン情報
+    my $last_version = (-f $DB_NAME) ? _get_last_version() : 0;
+
+    # 取得したバージョン情報が、指定されたバージョンより小さい場合はエラー
+    unless( $target_version <= $last_version ) {
+      error_msg("fail - db.version = ".$last_version.", options.version = ".$target_version);
+      die;
+    }
+
+    # 順番に環境をセットアップ(ロールバック)する
+    for (reverse($target_version..$last_version)) {
+
+      # ロールバックファイル
+      my $rollback_file_name = sprintf( $TEMPLATE_ROLLBACK_SQL_FILE_NAME, $_ );
+
+      # バージョン方法とロールバックファイル名
+      my $output_msg = " - version:$_ - $rollback_file_name";
+
+      # ロールバックファイルがない場合は終了する
+      unless (-f $rollback_file_name) {
+        error_msg("fail".$output_msg);
+        die;
+      }
+
+      # ロールバックを実行する
+      my ($cmd, $ver, $ret) = run_sql({ file => $rollback_file_name });
+
+      # 実行にした場合は終了する
+      if ($ret) {
+        error_msg("fail".$output_msg);
+        die;
+      }
+
+      # 実行が正常した次へ
+      info_msg("done".$output_msg);
+    }
+  };
+  return 1 if($@);
+  return 0;
+}
+
+sub _check {
+  eval {
+      # テーブル構造チェックファイル
+      my $check_file_name = $TEMPLATE_CHECK_SQL_FILE_NAME;
+
+      # 現在のテーブル構造を取得する
+      my ($cmd, $output, $ret) = run_sql({ str => ".schema" });
+
+      # 一時ファイルを作成し取得したテーブル構造を書き込む
+      my ($fn, $filename) = tempfile(UNLINK => 1); # unlink=1: プロセス終了時にファイルを削除する
+      print $fn $output;
+      close $fn;
+
+      # テーブル構造をチェックする
+      my $diff_cmd = "diff -u $check_file_name $filename";
+      my $result = `$diff_cmd`;
+      unless ($? == 0) {
+        error_msg("$diff_cmd\n$result");
+        die;
+      }
+      info_msg("ok");
+  };
+  return 1 if($@);
+  return 0;
+}
+
+sub _dump {
+  eval {
+    # ファイルオプションが指定されていない
+    unless (exists($options->{file}) and defined($options->{file})) {
+      error_msg("file must be specified");
+      die;
+    }
+
+    my $dump_file = $options->{file};
+
+    # 一時ファイルを作成しdump用のSQLを作成する
+    # 複数行のコマンドをファイルで渡せないため
+    my ($fn, $filename) = tempfile(UNLINK => 1); # unlink=1: プロセス終了時にファイルを削除する
+    print $fn ".output $dump_file\n";
+    print $fn ".dump\n";
+    print $fn ".output stdout\n"; # 念のため標準出力に戻しておく
+    close $fn;
+
+    # 現在のデータベースをダンプする
+    my ($cmd, $output, $ret) = run_sql({ file => $filename });
+    unless ($ret == 0) {
+      error_msg("$cmd\n$output");
+      die;
+    }
+    info_msg("ok");
+  };
+  return 1 if($@);
+  return 0;
+}
+
+sub _import {
+  eval {
+    # ファイルオプションが指定されていない
+    unless (exists($options->{file}) and defined($options->{file}) and -f $options->{file}) {
+      error_msg("file must be specified");
+      die;
+    }
+
+    my $import_file = $options->{file};
+
+    # データベースをインポートする
+    my ($cmd, $output, $ret) = run_sql({ str => ".read $import_file" });
+    unless ($ret == 0) {
+      error_msg("$cmd\n$output");
+      die;
+    }
+    info_msg("ok");
+  };
+  return 1 if($@);
+  return 0;
+}
+
+sub main {
+  # マイグレーション
+  if ($command eq 'migration') {
+    return _migration();
+
+  # ロールバック
+  } elsif ($command eq 'rollback') {
+    return _rollback();
+
+  # テーブル構造のチェック
+  } elsif ($command eq 'check') {
+    return _check();
+
+  # データベースをダンプする
+  } elsif ($command eq 'dump') {
+    return _dump();
+
+  # データベースをインポートする
+  } elsif ($command eq 'import') {
+    return _import();
+
+  # それ以外のコマンドの場合はエラー
+  } else {
+    error_msg("$command is not command");
+    return 1;
+  }
+}
+
+exit main();

@@ -1,0 +1,17 @@
+[package]
+name = "atb-db"
+version = "0.1.0"
+authors = ["Didy KUPANHY <d.kupanhy@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+rusqlite = "0.23.1"
+
+r2d2 = "0.8.9"
+r2d2_sqlite = "0.16.0"
+
+read-atb-config = { path = "../read-atb-config" }
+
+serde = { version = "1.0", features = ["derive"] }

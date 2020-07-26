@@ -1,0 +1,18 @@
+let makeConf = ./atb-conf-common.dhall
+
+in let type = ./atb-conf-type.dhall
+
+in let conf = {
+  database = {
+    sqlite3 = {
+      db_file = None
+    },
+    version = None
+  },
+  api = {
+    host = None,
+    port = None
+  }
+}
+
+in makeConf conf
